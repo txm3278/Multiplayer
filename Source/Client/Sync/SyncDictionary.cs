@@ -545,25 +545,41 @@ namespace Multiplayer.Client
 
             #region Designators
             {
-                // This is here to handle every other Designator that isn't implemented,
-                // by default they only need the type and that's being handled outside.
-                // Returning null is enough.
-                (ByteWriter data, Designator des) => {
-                    // These are handled in DesignatorPatches.WriteData
-                },
-                (ByteReader data) => {
-                    // These are handled in MapAsyncTimeComp.HandleDesignator
-                    return null;
-                }, true // <- isImplicit: true
+                // Catch all for all Designators, merely signals to construct them
+                // We can't construct them here because we need to signal ReadSyncObject
+                // to change the type, which is not possible from a SyncWorker.
+                (SyncWorker sync, ref Designator designator) => {
+
+                }, true, true // <- Implicit ShouldConstruct
             },
             {
-                // The only special case in vanilla that has arguments, mods can add their own as explicit types.
-                (ByteWriter data, Designator_Build build) => {
-                    WriteSync(data, build.entDef);
-                },
-                (ByteReader data) => {
-                    BuildableDef def = ReadSync<BuildableDef>(data);
-                    return new Designator_Build(def);
+                (SyncWorker sync, ref Designator_Place place) => {
+                    if (sync.isWriting) {
+                        sync.Write(place.placingRot);
+                    } else {
+                        place.placingRot = sync.Read<Rot4>();
+                    }
+                }, true, true // <- Implicit ShouldConstruct
+            },
+            {
+                // Designator_Build is a Designator_Place but we aren't using Implicit
+                // We can't take part of the implicit tree because Designator_Build has an argument
+                // So we need to implement placingRot here too, until we separate instancing from decorating.
+                (SyncWorker sync, ref Designator_Build build) => {
+                    if (sync.isWriting) {
+                        sync.Write(build.PlacingDef);
+                        sync.Write(build.placingRot);
+                        if (build.PlacingDef.MadeFromStuff) {
+                            sync.Write(build.stuffDef);
+                        }
+                    } else {
+                        var def = sync.Read<BuildableDef>();
+                        build = new Designator_Build(def);
+                        build.placingRot = sync.Read<Rot4>();
+                        if (build.PlacingDef.MadeFromStuff) {
+                            build.stuffDef = sync.Read<ThingDef>();
+                        }
+                    }
                 }
             },
             #endregion
@@ -600,28 +616,6 @@ namespace Multiplayer.Client
 
                     return (parent.gun as ThingWithComps).TryGetComp<CompChangeableProjectile>();
                 }
-            },
-            {
-                (ByteWriter data, ThingComp comp) => {
-                    if (comp != null) {
-                        data.WriteUShort((ushort)Array.IndexOf(thingCompTypes, comp.GetType()));
-                        WriteSync(data, comp.parent);
-                    } else {
-                        data.WriteUShort(ushort.MaxValue);
-                    }
-                },
-                (ByteReader data) => {
-                    ushort compTypeId = data.ReadUShort();
-                    if (compTypeId == ushort.MaxValue)
-                        return null;
-
-                    ThingWithComps parent = ReadSync<ThingWithComps>(data);
-                    if (parent == null)
-                        return null;
-
-                    Type compType = thingCompTypes[compTypeId];
-                    return parent.AllComps.Find(comp => comp.props.compClass == compType);
-                }, true
             },
             #endregion
 
@@ -706,6 +700,30 @@ namespace Multiplayer.Client
                     return ThingsById.thingsById.GetValueSafe(thingId);
                 }
             },
+            {
+                (SyncWorker data, ref ThingComp comp) => {
+                    if (data.isWriting) {
+                        if (comp != null) {
+                            ushort index = (ushort)Array.IndexOf(thingCompTypes, comp.GetType());
+                            data.Write(index);
+                            data.Write(comp.parent);
+                        } else {
+                            data.Write(ushort.MaxValue);
+                        }
+                    } else {
+                        ushort index = data.Read<ushort>();
+                        if (index == ushort.MaxValue) {
+                            return;
+                        }
+                        ThingWithComps parent = data.Read<ThingWithComps>();
+                        if (parent == null) {
+                            return;
+                        }
+                        Type compType = thingCompTypes[index];
+                        comp = parent.AllComps.Find(c => c.props.compClass == compType);
+                    }
+                }, true // implicit
+            },
             #endregion
 
             #region RoyalTitlePermitWorker
@@ -741,6 +759,30 @@ namespace Multiplayer.Client
                 (ByteWriter data, MultiplayerMapComp comp) => data.MpContext().map = comp.map,
                 (ByteReader data) => (data.MpContext().map).MpComp()
             },
+            {
+                (SyncWorker data, ref MapComponent comp) => {
+                    if (data.isWriting) {
+                        if (comp != null) {
+                            ushort index = (ushort)Array.IndexOf(mapCompTypes, comp.GetType());
+                            data.Write(index);
+                            data.Write(comp.map);
+                        } else {
+                            data.Write(ushort.MaxValue);
+                        }
+                    } else {
+                        ushort index = data.Read<ushort>();
+                        if (index == ushort.MaxValue) {
+                            return;
+                        }
+                        Map map = data.Read<Map>();
+                        if (map == null) {
+                            return;
+                        }
+                        Type compType = mapCompTypes[index];
+                        comp = map.GetComponent(compType);
+                    }
+                }, true  // implicit
+            },
             #endregion
 
             #region World
@@ -757,27 +799,74 @@ namespace Multiplayer.Client
                 }
             },
             {
-                (ByteWriter data, WorldObjectComp comp) => {
-                    if (comp != null) {
-                        ushort index = (ushort)Array.IndexOf(worldObjectCompTypes, comp.GetType());
-                        data.WriteUShort(index);
-                        WriteSync(data, comp.parent);
+                (SyncWorker data, ref WorldObjectComp comp) => {
+                    if (data.isWriting) {
+                        if (comp != null) {
+                            ushort index = (ushort)Array.IndexOf(worldObjectCompTypes, comp.GetType());
+                            data.Write(index);
+                            data.Write(comp.parent);
+                        } else {
+                            data.Write(ushort.MaxValue);
+                        }
                     } else {
-                        data.WriteInt32(ushort.MaxValue);
+                        ushort index = data.Read<ushort>();
+                        if (index == ushort.MaxValue) {
+                            return;
+                        }
+                        WorldObject parent = data.Read<WorldObject>();
+                        if (parent == null) {
+                            return;
+                        }
+                        Type compType = worldObjectCompTypes[index];
+                        comp = parent.GetComponent(compType);
                     }
-                },
-                (ByteReader data) => {
-                    ushort compTypeId = data.ReadUShort();
-                    if (compTypeId == ushort.MaxValue)
-                        return null;
+                }, true // implicit
+            },
+            {
+                (SyncWorker data, ref WorldComponent comp) => {
+                    if (data.isWriting) {
+                        if (comp != null) {
+                            ushort index = (ushort)Array.IndexOf(worldCompTypes, comp.GetType());
+                            data.Write(index);
+                            data.Write(comp.world);
+                        } else {
+                            data.Write(ushort.MaxValue);
+                        }
+                    } else {
+                        ushort index = data.Read<ushort>();
+                        if (index == ushort.MaxValue) {
+                            return;
+                        }
+                        Type compType = worldCompTypes[index];
+                        World world = data.Read<World>();
+                        if (world == null) {
+                            return;
+                        }
+                        comp = world.GetComponent(compType);
+                    }
+                }, true // implicit
+            },
+            #endregion
 
-                    WorldObject parent = ReadSync<WorldObject>(data);
-                    if (parent == null)
-                        return null;
-
-                    Type compType = worldObjectCompTypes[compTypeId];
-                    return parent.AllComps.Find(comp => comp.props.compClass == compType);
-                  }
+            #region Game
+            {
+                (SyncWorker data, ref GameComponent comp) => {
+                    if (data.isWriting) {
+                        if (comp != null) {
+                            ushort index = (ushort)Array.IndexOf(gameCompTypes, comp.GetType());
+                            data.Write(index);
+                        } else {
+                            data.Write(ushort.MaxValue);
+                        }
+                    } else {
+                        ushort index = data.Read<ushort>();
+                        if (index == ushort.MaxValue) {
+                            return;
+                        }
+                        Type compType = worldCompTypes[index];
+                        comp = Current.Game.GetComponent(compType);
+                    }
+                }, true // implicit
             },
             #endregion
 
